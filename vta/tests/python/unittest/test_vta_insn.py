@@ -15,11 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 """Unit test VTA's instructions """
+import os, sys, json
+
 import tvm
 from tvm import te
 import numpy as np
 from tvm import topi
 from tvm.contrib import utils
+from tvm import rpc, autotvm, relay
 
 import vta
 import vta.testing
@@ -560,6 +563,19 @@ def test_runtime_array():
 
 
 if __name__ == "__main__":
+
+    env = vta.get_env()
+    
+    tracker_host = os.environ.get("TVM_TRACKER_HOST", "10.201.135.166")
+    tracker_port = os.environ.get("TVM_TRACKER_PORT", 8104)
+
+    device_host = os.environ.get("VTA_RPC_HOST", "10.201.135.166")
+    device_port = os.environ.get("VTA_RPC_PORT", "8104")
+
+    remote = autotvm.measure.request_remote(env.TARGET, tracker_host, int(tracker_port), timeout=10000)
+    vta.reconfig_runtime(remote)
+    vta.program_fpga(remote, bitstream=None)
+
     test_runtime_array()
     test_save_load_out()
     test_padded_load()

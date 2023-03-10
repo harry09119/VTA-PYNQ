@@ -105,8 +105,8 @@ if env.TARGET not in ["sim", "tsim", "intelfocl"]:
     # Get remote from tracker node if environment variable is set.
     # To set up the tracker, you'll need to follow the "Auto-tuning
     # a convolutional network for VTA" tutorial.
-    tracker_host = os.environ.get("TVM_TRACKER_HOST", None)
-    tracker_port = os.environ.get("TVM_TRACKER_PORT", None)
+    tracker_host = os.environ.get("TVM_TRACKER_HOST", "10.201.135.166")
+    tracker_port = os.environ.get("TVM_TRACKER_PORT", 8104)
     # Otherwise if you have a device you want to program directly from
     # the host, make sure you've set the variables below to the IP of
     # your board.
