@@ -20,6 +20,7 @@
 from collections import namedtuple
 import logging
 import os
+import numpy as np
 
 import tvm
 from tvm import te
@@ -77,8 +78,6 @@ def conv2d(N, CI, H, W, CO, KH, KW, strides, padding, dilation):
     # 2D convolution layer dimensions taken from ResNet-18 architecture
     # (9th convolutional layer)
     with tvm.target.vta():
-        # 2D convolution layer dimensions taken from ResNet-18 architecture
-        # (9th convolutional layer)
         batch_size = 1
         height = 32
         width = 32
@@ -134,10 +133,11 @@ def conv2d(N, CI, H, W, CO, KH, KW, strides, padding, dilation):
         # Input placeholder tensors
         data = te.placeholder(data_shape, name="data", dtype=env.inp_dtype)
         kernel = te.placeholder(kernel_shape, name="kernel", dtype=env.wgt_dtype)
-
+        
         # Copy buffers:
         #   Apply spatial padding to input feature map
         data_buf = topi.nn.pad(data, [0, 0, pad_h, pad_w, 0, 0], name="data_buf")
+        data_buf = te.compute(data_shape, lambda *i: data_buf(*i), "data_buf")
         kernel_buf = te.compute(kernel_shape, lambda *i: kernel(*i), "kernel_buf")
 
         # Declare 2D convolution
@@ -150,21 +150,21 @@ def conv2d(N, CI, H, W, CO, KH, KW, strides, padding, dilation):
             ),
             name="res_conv",
         )
-
+       
         # Add shift stage for fix-point normalization
         res_shr = te.compute(output_shape, lambda *i: res_conv(*i) >> 8, name="res_shr")
 
         # Apply clipping between (0, input max value)
-        res_min = te.compute(output_shape, lambda *i: tvm.te.min(res_shr(*i), tvm.tir.const(127,env.acc_dtype)), name="res_min")
-        res_max = te.compute(output_shape, lambda *i: tvm.te.max(res_min(*i), tvm.tir.const(0,env.acc_dtype)), name="res_max")
+        #res_min = te.compute(output_shape, lambda *i: tvm.te.min(res_shr(*i), tvm.tir.const(127,env.acc_dtype)), name="res_min")
+        #res_max = te.compute(output_shape, lambda *i: tvm.te.max(res_min(*i), tvm.tir.const(0,env.acc_dtype)), name="res_max")
 
         # Result Tensor
-        res = te.compute(output_shape, lambda *i: res_max(*i).astype(env.acc_dtype), name="res")
+        res = te.compute(output_shape, lambda *i: res_shr(*i).astype(env.acc_dtype), name="res")
         # Create TVM schedule
         s = te.create_schedule(res.op)
         # Let's look at the default TVM schedule
         #print(tvm.lower(s, [data, kernel, res], simple_mode=True))
-
+        data_buf
         # Let's define tiling sizes
         b_, oc_, y_, x_, _, _ = s[res_conv].op.axis
         ic_, _, _, _ = s[res_conv].op.reduce_axis
@@ -174,9 +174,17 @@ def conv2d(N, CI, H, W, CO, KH, KW, strides, padding, dilation):
         cfg.define_split("tile_y", y_, num_outputs=2)
         cfg.define_split("tile_x", x_, num_outputs=2)
         cfg.define_split("tile_ic", ic_, num_outputs=2)
-        cfg.define_knob("oc_nthread", [1, 2])
-        cfg.define_knob("h_nthread", [1, 2])
-
+        #cfg.define_knob("oc_nthread", [1, 2])
+        #cfg.define_knob("h_nthread", [1, 2])
+        
+        cfg.add_flop(
+            2
+            * np.prod(output_shape)
+            * kernel_h
+            * kernel_w
+            * (in_channels // env.BLOCK_IN)
+            * env.BLOCK_IN
+        )
         #  the batch dimension has no effect)
         b, oc, y, x, b_tns, oc_tns = s[res].op.axis
         b_out, b_inn = cfg["tile_b"].apply(s, res, b)
@@ -188,16 +196,20 @@ def conv2d(N, CI, H, W, CO, KH, KW, strides, padding, dilation):
         # Move intermediate computation into each output compute tile
         s[res_conv].compute_at(s[res], x_out)
         s[res_shr].compute_at(s[res], x_out)
-        s[res_min].compute_at(s[res], x_out)
-        s[res_max].compute_at(s[res], x_out)
+        #s[res_min].compute_at(s[res], x_out)
+        #s[res_max].compute_at(s[res], x_out)
 
         # Apply additional loop split along reduction axis (input channel)
         b_inn, oc_inn, y_inn, x_inn, b_tns, oc_tns = s[res_conv].op.axis
         ic_out, ic_inn = cfg["tile_ic"].apply(s,res_conv,ic)
 
         s[res_conv].reorder(ic_out, b_inn, oc_inn, y_inn, ic_inn, dy, dx, x_inn, b_tns, oc_tns, ic_tns)
-
+        
+        _, tx = s[res].split(oc_out, factor=2)
+        s[res].reorder(tx, b_out)
+        s[res].bind(tx, te.thread_axis("cthread"))
         # VTA only supports 2 virtual threads
+        """
         if cfg["oc_nthread"].val > 1:
             _, v_t = s[res].split(oc_out, factor=cfg["oc_nthread"].val)
             s[res].reorder(v_t, b)
@@ -205,10 +217,10 @@ def conv2d(N, CI, H, W, CO, KH, KW, strides, padding, dilation):
 
         # virtual threading along spatial rows
         if cfg["h_nthread"].val > 1:
-            _, v_t = s[output].split(y_out, factor=cfg["h_nthread"].val)
+            _, v_t = s[res].split(y_out, factor=cfg["h_nthread"].val)
             s[res].reorder(v_t, b)
             s[res].bind(v_t, te.thread_axis("cthread"))
-
+        """
         # Let's look at the current TVM schedule after blocking and virtual threading
         #print(tvm.lower(s, [data, kernel, res], simple_mode=True))
 
@@ -217,8 +229,8 @@ def conv2d(N, CI, H, W, CO, KH, KW, strides, padding, dilation):
         s[kernel_buf].set_scope(env.wgt_scope)
         s[res_conv].set_scope(env.acc_scope)
         s[res_shr].set_scope(env.acc_scope)
-        s[res_min].set_scope(env.acc_scope)
-        s[res_max].set_scope(env.acc_scope)
+        #s[res_min].set_scope(env.acc_scope)
+        #s[res_max].set_scope(env.acc_scope)
 
         # Block data and kernel cache reads
         s[data_buf].compute_at(s[res_conv], ic_out)
@@ -235,9 +247,9 @@ def conv2d(N, CI, H, W, CO, KH, KW, strides, padding, dilation):
 
         # Add an ALU pragma over the shift and clipping operations
         s[res_shr].pragma(s[res_shr].op.axis[0], env.alu)
-        s[res_min].pragma(s[res_min].op.axis[0], env.alu)
-        s[res_max].pragma(s[res_max].op.axis[0], env.alu)
-    return s, [data,kernel, res_conv]
+        #s[res_min].pragma(s[res_min].op.axis[0], env.alu)
+        #s[res_max].pragma(s[res_max].op.axis[0], env.alu)
+    return s, [data,kernel, res]
 """
     data_shape = (N // env.BATCH, CI // env.BLOCK_IN, H, W, env.BATCH, env.BLOCK_IN)
     kernel_shape = (CO // env.BLOCK_OUT, CI // env.BLOCK_IN, KH, KW, env.BLOCK_OUT, env.BLOCK_IN)
@@ -272,7 +284,7 @@ if __name__ == "__main__":
     # Logging config (for printing tuning log to the screen)
     logging.basicConfig()
     # logging.getLogger('autotvm').setLevel(logging.DEBUG)
-
+    logging.getLogger('autotvm').setLevel(logging.DEBUG)
     # Tuning log files
     log_file = "%s.conv2d.log" % (env.TARGET)
     # create tmp log file

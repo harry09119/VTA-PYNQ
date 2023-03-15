@@ -54,17 +54,19 @@ log file to get the best knob parameters.
 # Now return to python code. Import packages.
 import sys
 import os
+from time import time
 import torch
 import numpy as np
 from PIL import Image
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from tvm import topi
 import tvm
 from tvm import te
 from tvm import rpc, autotvm, relay
 from tvm.contrib import graph_executor, utils, download
-from tvm.relay.testing.darknet import __darknetffi__
-from tvm.relay.testing import yolo_detection, darknet
 from tvm.contrib.download import download_testdata
 from tvm.autotvm.measure.measure_methods import request_remote
 from tvm.autotvm.tuner import XGBTuner, GATuner, RandomTuner, GridSearchTuner
@@ -75,54 +77,26 @@ from vta.testing import simulator
 from vta.top import graph_pack
 import logging
 
-def bring_network(model_name='yolov3-tiny'):
+def bring_network(ic,oc,is_,ks,st):
 ##############################################################################
 # Download yolo net configure file, weight file, darknet library file based on
 # Model Name
 # ----------------------------------------------------------------------------
-    MODEL_NAME = "yolov3-tiny"
-    REPO_URL = "https://github.com/dmlc/web-data/blob/main/darknet/"
+    class conv(nn.Module):
+        def __init__(self,ic,oc,ks,st):
+            super(conv, self).__init__()
+            self.layer = nn.Conv2d(in_channels=ic,out_channels=oc,kernel_size=ks,stride=st,bias=False)
 
-    cfg_path = download_testdata(
-        "https://github.com/pjreddie/darknet/blob/master/cfg/" + MODEL_NAME + ".cfg" + "?raw=true",
-        MODEL_NAME + ".cfg",
-        module="darknet",
-    )
-    weights_path = download_testdata(
-        "https://pjreddie.com/media/files/" + MODEL_NAME + ".weights" + "?raw=true",
-        MODEL_NAME + ".weights",
-        module="darknet",
-    )
+        def forward(self,x):
+            x = self.layer(x)
+            return x
 
-    if sys.platform in ["linux", "linux2"]:
-        darknet_lib_path = download_testdata(
-            REPO_URL + "lib/" + "libdarknet2.0.so" + "?raw=true", "libdarknet2.0.so", module="darknet"
-        )
-    elif sys.platform == "darwin":
-        darknet_lib_path = download_testdata(
-            REPO_URL + "lib_osx/" + "libdarknet_mac2.0.so" + "?raw=true",
-            "libdarknet_mac2.0.so",
-            module="darknet",
-        )
-    else:
-        raise NotImplementedError("Darknet lib is not supported on {} platform".format(sys.platform))
+    model = conv(ic,oc,ks,st)
+    input_shape = [1, ic, is_, is_]
+    input_data = torch.randn(input_shape)*10
+    scripted_model = torch.jit.trace(model, input_data).eval()
 
-    ##################################################
-    # Download yolo categories and illustration front.
-    # ------------------------------------------------
-    coco_path = download_testdata(
-        REPO_URL + "data/" + "coco.names" + "?raw=true", "coco.names", module="data"
-    )
-    font_path = download_testdata(
-        REPO_URL + "data/" + "arial.ttf" + "?raw=true", "arial.ttf", module="data"
-    )
-    with open(coco_path) as f:
-        content = f.readlines()
-    names = [x.strip() for x in content]
-    
-    net = __darknetffi__.dlopen(darknet_lib_path).load_network(cfg_path.encode("utf-8"), weights_path.encode("utf-8"), 0)
-
-    return net
+    return scripted_model, input_shape
 
 #logging.getLogger('autotvm').setLevel(logging.DEBUG)
 
@@ -131,17 +105,18 @@ def bring_network(model_name='yolov3-tiny'):
 # ---------------
 # Perform vta-specific compilation with Relay from a Gluon model
 
-def compile_network(env, target, model):
+def compile_network(env, target, model,ic,oc,is_,ks,st):
 
     # Get off the shelf gluon model, and convert to relay
-    net = bring_network()
-    mod, params = relay.frontend.from_darknet(net, dtype="float32", shape=(env.BATCH, net.c, net.h, net.w))
+    net ,ishape= bring_network(ic,oc,is_,ks,st)
+    mod, params = relay.frontend.from_pytorch(net, [("input0",ishape)])
+    print(mod)
     # Perform quantization in Relay
     # Note: We set opt_level to 3 in order to fold batch norm
     with tvm.transform.PassContext(opt_level=3):
-        with relay.quantize.qconfig(global_scale=8.0, skip_conv_layers=[0]):
+        with relay.quantize.qconfig(global_scale=8.0):
             mod = relay.quantize.quantize(mod, params=params)
-
+            print(mod)
     # Perform graph packing and constant folding for VTA target
     if target.device_name == "vta":
         assert env.BLOCK_IN == env.BLOCK_OUT
@@ -150,12 +125,12 @@ def compile_network(env, target, model):
             env.BATCH,
             env.BLOCK_OUT,
             env.WGT_WIDTH,
-            start_name='nn.max_pool2d',
-            stop_name='cast',
-            start_name_idx=4,
-            stop_name_idx=186
+            start_name='cast',
+            stop_name='annotation.stop_fusion',
+            start_name_idx=3,
+            stop_name_idx=9
         )
-
+    print(relay_prog)
     return relay_prog, params
 
 
@@ -246,28 +221,7 @@ target = env.target if device == "vta" else env.target_vta_cpu
 # The ``start_pack`` and ``stop_pack`` labels indicate where
 # to start and end the graph packing relay pass: in other words
 # where to start and finish offloading to VTA.
-network = "yolov3-tiny"
-
-# Tuning option
-log_file = "%s.%s.log" % (device, network)
-tuning_option = {
-    "log_filename": log_file,
-    "tuner": "xgb_knob",
-    "n_trial": 100,
-    "early_stopping": None,
-    "measure_option": autotvm.measure_option(
-        builder=autotvm.LocalBuilder(),
-        runner=autotvm.RPCRunner(
-            env.TARGET,
-            host=tracker_host,
-            port=int(tracker_port),
-            number=5,
-            timeout=60,
-            module_loader=vta.module_loader(),
-            # check_correctness=True, # TODO: re-enable when check_correctness works again.
-        ),
-    ),
-}
+network = "normal_conv2d_32"
 
 ####################################################################
 #
@@ -302,7 +256,7 @@ def tune_tasks(
     log_filename="tuning.log",
     use_transfer_learning=True,
 ):
-
+    
     # create tmp log file
     tmp_log_file = log_filename + ".tmp"
     if os.path.exists(tmp_log_file):
@@ -405,154 +359,110 @@ def register_vta_tuning_tasks():
 # Finally, we launch tuning jobs and evaluate the end-to-end performance.
 
 
-def tune_and_evaluate(tuning_opt):
-
-    # Register VTA tuning tasks
-    #register_vta_tuning_tasks()
-
+def tune_and_evaluate():
     # Perform task extraction on Relay program
+    print("Extract tasks...")
+    ic,oc,is_,ks,st = 16, 32, 16, 3, 1
+    relay_prog, params = compile_network(env, target, network,ic,oc,is_,ks,st)
+
+    register_vta_tuning_tasks()
+
+    mod = tvm.IRModule.from_expr(relay_prog)
+    print("Target_host:",env.target_host)
+    tasks = autotvm.task.extract_from_program(
+        mod,
+        params=params,
+        target=target,
+        target_host=env.target_host,
+    )
+
+    # filter out non-packed conv2d task
+
+    # We should have extracted 10 convolution tasks
+    print("Extracted {} tasks:".format(len(tasks)))
+    print(tasks)
+    log_filename = "%s_OC_%s.log" % (device, oc)
+    # We do not run the tuning in our webpage server since it takes too long.
+    # Comment the following line to run it by yourself.
+    #return
+    tuning_option = {
+        "log_filename": log_filename,
+        "tuner": "xgb_knob",
+        "n_trial": 1000,
+        "early_stopping": None,
+        "measure_option": autotvm.measure_option(
+            builder=autotvm.LocalBuilder(),
+            runner=autotvm.RPCRunner(
+                env.TARGET,
+                host=tracker_host,
+                port=int(tracker_port),
+                number=5,
+                timeout=60,
+                module_loader=vta.module_loader(),
+                # check_correctness=True, # TODO: re-enable when check_correctness works again.
+            ),
+        ),
+    }
+ 
+    # run tuning tasks
+    print("Tuning...")
+    #start = time()    
+    #tune_tasks(tasks, **tuning_option)
+    #print("> tuning time =",time()-start)
+    # evaluate with tuning history
+    if env.TARGET != "sim":
+        # Get remote from fleet node
+        remote = autotvm.measure.request_remote(
+            env.TARGET, tracker_host, tracker_port, timeout=10000
+        )
+        # Reconfigure the JIT runtime and FPGA.
+        vta.reconfig_runtime(remote)
+        vta.program_fpga(remote, bitstream=None)
+    else:
+        # In simulation mode, host the RPC server locally.
+        remote = rpc.LocalSession()
+    
+    # compile kernels with history best records
     with autotvm.tophub.context(target):
-        print("Extract tasks...")
-        relay_prog, params = compile_network(env, target, network)
+    #with autotvm.tophub.context(target, extra_files=[log_filename]):
+        # Compile network
+        print("Compile to ",target.device_name,"...")
+        if target.device_name != "vta":
+            with tvm.transform.PassContext(opt_level=2, disabled_pass={"AlterOpLayout"}):
+                lib = relay.build(
+                    relay_prog, target=target, params=params, target_host=env.target_host
+                )
+        else:
+            with vta.build_config(disabled_pass={"AlterOpLayout","tir.CommonSubexprElimTIR"}):
+                graph, lib , params= relay.build(
+                    relay_prog, target=target, params=params, target_host=env.target_host
+                )
 
-        register_vta_tuning_tasks()
+        # Export library
+        print("Upload...")
+        temp = utils.tempdir()
+        lib.export_library(temp.relpath("graphlib.tar"))
+        remote.upload(temp.relpath("graphlib.tar"))
+        lib = remote.load_module("graphlib.tar")
 
-        mod = tvm.IRModule.from_expr(relay_prog)
-        print("Target_host:",env.target_host)
-        tasks = autotvm.task.extract_from_program(
-            mod,
-            params=params,
-            ops=(relay.op.get("nn.conv2d"),relay.op.get("nn.dense"),),
-            target=target,
-            target_host=env.target_host,
+        # Generate the graph executor
+        ctx = remote.ext_dev(0) if device == "vta" else remote.cpu(0)
+        #m = graph_executor.GraphModule(lib["default"](ctx))
+        m = graph_executor.create(graph, lib,ctx)
+
+        # upload parameters to device
+        image = tvm.nd.array((np.random.uniform(size=(1, ic, is_, is_))).astype("float32"))
+        m.set_input("input0", image)
+
+        # evaluate
+        print("Evaluate inference time cost...")
+        timer = m.module.time_evaluator("run", ctx, number=1, repeat=10)
+        tcost = timer()
+        prof_res = np.array(tcost.results) * 1000  # convert to millisecond
+        print(
+            "Mean inference time (std dev): %.2f ms (%.2f ms)"
+            % (np.mean(prof_res), np.std(prof_res))
         )
 
-        # filter out non-packed conv2d task
-
-        # We should have extracted 10 convolution tasks
-        print("Extracted {} tasks:".format(len(tasks)))
-        print(tasks)
-        # We do not run the tuning in our webpage server since it takes too long.
-        # Comment the following line to run it by yourself.
-        #return
-
-        # run tuning tasks
-        print("Tuning...")
-        tune_tasks(tasks, **tuning_opt)
-"""        
-        # evaluate with tuning history
-        if env.TARGET != "sim":
-            # Get remote from fleet node
-            remote = autotvm.measure.request_remote(
-                env.TARGET, tracker_host, tracker_port, timeout=10000
-            )
-            # Reconfigure the JIT runtime and FPGA.
-            vta.reconfig_runtime(remote)
-            vta.program_fpga(remote, bitstream=None)
-        else:
-            # In simulation mode, host the RPC server locally.
-            remote = rpc.LocalSession()
-        
-        # compile kernels with history best records
-        with autotvm.tophub.context(target, extra_files=[log_file]):
-            # Compile network
-            print("Compile to ",target.device_name,"...")
-            if target.device_name != "vta":
-                with tvm.transform.PassContext(opt_level=2, disabled_pass={"AlterOpLayout"}):
-                    lib = relay.build(
-                        relay_prog, target=target, params=params, target_host=env.target_host
-                    )
-            else:
-                with vta.build_config(disabled_pass={"AlterOpLayout","tir.CommonSubexprElimTIR"}):
-                    graph, lib , params= relay.build(
-                        relay_prog, target=target, params=params, target_host=env.target_host
-                    )
-
-            # Export library
-            print("Upload...")
-            temp = utils.tempdir()
-            lib.export_library(temp.relpath("graphlib.tar"))
-            remote.upload(temp.relpath("graphlib.tar"))
-            lib = remote.load_module("graphlib.tar")
-
-            # Generate the graph executor
-            ctx = remote.ext_dev(0) if device == "vta" else remote.cpu(0)
-            #m = graph_executor.GraphModule(lib["default"](ctx))
-            m = graph_executor.create(graph, lib,ctx)
-
-            # upload parameters to device
-            image = tvm.nd.array((np.random.uniform(size=(1, 3, 224, 224))).astype("float32"))
-            m.set_input("data", image)
-
-            # evaluate
-            print("Evaluate inference time cost...")
-            timer = m.module.time_evaluator("run", ctx, number=1, repeat=10)
-            tcost = timer()
-            prof_res = np.array(tcost.results) * 1000  # convert to millisecond
-            print(
-                "Mean inference time (std dev): %.2f ms (%.2f ms)"
-                % (np.mean(prof_res), np.std(prof_res))
-            )
-
-"""
 # Run the tuning and evaluate the results
-tune_and_evaluate(tuning_option)
-
-######################################################################
-# Sample Output
-# -------------
-# The tuning needs to compile many programs and extract feature from them.
-# So a high performance CPU is recommended.
-# One sample output is listed below.
-# It takes about 2 hours on a 16T CPU, and 6 Pynq boards.
-#
-# .. code-block:: bash
-#
-#    Extract tasks...
-#    [Warning] Invalid shape during AutoTVM task creation
-#    Extracted 10 conv2d tasks:
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 16, 14, 14, 1, 16), 'int8'), ('TENSOR', (32, 16, 1, 1, 16, 16), 'int8'), (2, 2), (0, 0), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 16, 14, 14, 1, 16, 'int8'), (32, 16, 1, 1, 16, 16, 'int8'), (2, 2), (0, 0), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 8, 28, 28, 1, 16), 'int8'), ('TENSOR', (16, 8, 1, 1, 16, 16), 'int8'), (2, 2), (0, 0), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 8, 28, 28, 1, 16, 'int8'), (16, 8, 1, 1, 16, 16, 'int8'), (2, 2), (0, 0), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 4, 56, 56, 1, 16), 'int8'), ('TENSOR', (8, 4, 1, 1, 16, 16), 'int8'), (2, 2), (0, 0), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 4, 56, 56, 1, 16, 'int8'), (8, 4, 1, 1, 16, 16, 'int8'), (2, 2), (0, 0), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 4, 56, 56, 1, 16), 'int8'), ('TENSOR', (4, 4, 3, 3, 16, 16), 'int8'), (1, 1), (1, 1), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 4, 56, 56, 1, 16, 'int8'), (4, 4, 3, 3, 16, 16, 'int8'), (1, 1), (1, 1), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 8, 28, 28, 1, 16), 'int8'), ('TENSOR', (8, 8, 3, 3, 16, 16), 'int8'), (1, 1), (1, 1), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 8, 28, 28, 1, 16, 'int8'), (8, 8, 3, 3, 16, 16, 'int8'), (1, 1), (1, 1), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 4, 56, 56, 1, 16), 'int8'), ('TENSOR', (8, 4, 3, 3, 16, 16), 'int8'), (2, 2), (1, 1), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 4, 56, 56, 1, 16, 'int8'), (8, 4, 3, 3, 16, 16, 'int8'), (2, 2), (1, 1), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 16, 14, 14, 1, 16), 'int8'), ('TENSOR', (16, 16, 3, 3, 16, 16), 'int8'), (1, 1), (1, 1), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 16, 14, 14, 1, 16, 'int8'), (16, 16, 3, 3, 16, 16, 'int8'), (1, 1), (1, 1), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 8, 28, 28, 1, 16), 'int8'), ('TENSOR', (16, 8, 3, 3, 16, 16), 'int8'), (2, 2), (1, 1), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 8, 28, 28, 1, 16, 'int8'), (16, 8, 3, 3, 16, 16, 'int8'), (2, 2), (1, 1), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 32, 7, 7, 1, 16), 'int8'), ('TENSOR', (32, 32, 3, 3, 16, 16), 'int8'), (1, 1), (1, 1), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 32, 7, 7, 1, 16, 'int8'), (32, 32, 3, 3, 16, 16, 'int8'), (1, 1), (1, 1), (1, 1), 'NCHW1n16c', 'int32'))
-#        Task(func_name=topi_nn_conv2d, args=(('TENSOR', (1, 16, 14, 14, 1, 16), 'int8'), ('TENSOR', (32, 16, 3, 3, 16, 16), 'int8'), (2, 2), (1, 1), (1, 1), 'NCHW1n16c', 'int32'), kwargs={}, workload=('conv2d', (1, 16, 14, 14, 1, 16, 'int8'), (32, 16, 3, 3, 16, 16, 'int8'), (2, 2), (1, 1), (1, 1), 'NCHW1n16c', 'int32'))
-#    Tuning...
-#    [Task  1/10]  Current/Best:    0.72/  23.24 GFLOPS | Progress: (480/1000) | 640.31 s Done.
-#    [Task  2/10]  Current/Best:    0.00/  27.69 GFLOPS | Progress: (576/1000) | 810.09 s Done.
-#    [Task  3/10]  Current/Best:    0.00/  22.97 GFLOPS | Progress: (1000/1000) | 1125.37 s Done.
-#    [Task  4/10]  Current/Best:    0.00/  31.26 GFLOPS | Progress: (1000/1000) | 1025.52 s Done.
-#    [Task  5/10]  Current/Best:    0.00/  15.15 GFLOPS | Progress: (1000/1000) | 1236.58 s Done.
-#    [Task  6/10]  Current/Best:    0.00/  22.74 GFLOPS | Progress: (1000/1000) | 906.60 s Done.
-#    [Task  7/10]  Current/Best:    0.00/  15.27 GFLOPS | Progress: (1000/1000) | 1056.25 s Done.
-#    [Task  8/10]  Current/Best:    0.00/   2.18 GFLOPS | Progress: (1000/1000) | 2275.29 s Done.
-#    [Task  9/10]  Current/Best:    2.23/   3.99 GFLOPS | Progress: (1000/1000) | 2527.25 s Done.
-#    [Task 10/10]  Current/Best:    1.56/   6.32 GFLOPS | Progress: (480/1000) | 1304.84 s Done.
-#    Compile...
-#    Upload...
-#    Evaluate inference time cost...
-#    Mean inference time (std dev): 621.79 ms (0.14 ms)
-
-######################################################################
-#
-# .. note:: **Experiencing Difficulties?**
-#
-#   The auto tuning module is error-prone. If you always see " 0.00/ 0.00 GFLOPS",
-#   then there must be something wrong.
-#
-#   First, make sure you set the correct configuration of your device.
-#   Then, you can print debug information by adding these lines in the beginning
-#   of the script. It will print every measurement result, where you can find useful
-#   error messages.
-#
-#   .. code-block:: python
-#
-#      import logging
-#      logging.getLogger('autotvm').setLevel(logging.DEBUG)
-#
-#   Finally, always feel free to ask our community for help on https://discuss.tvm.apache.org
-
+tune_and_evaluate()
