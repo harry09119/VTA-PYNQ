@@ -93,7 +93,7 @@ def bring_network(ic,oc,is_,ks,st):
 
     model = conv(ic,oc,ks,st)
     input_shape = [1, ic, is_, is_]
-    input_data = torch.randn(input_shape)*10
+    input_data = torch.randn(input_shape)
     scripted_model = torch.jit.trace(model, input_data).eval()
 
     return scripted_model, input_shape
@@ -362,7 +362,7 @@ def register_vta_tuning_tasks():
 def tune_and_evaluate():
     # Perform task extraction on Relay program
     print("Extract tasks...")
-    ic,oc,is_,ks,st = 16, 32, 16, 3, 1
+    ic,oc,is_,ks,st = 16, 32, 176, 1, 1
     relay_prog, params = compile_network(env, target, network,ic,oc,is_,ks,st)
 
     register_vta_tuning_tasks()
@@ -381,7 +381,7 @@ def tune_and_evaluate():
     # We should have extracted 10 convolution tasks
     print("Extracted {} tasks:".format(len(tasks)))
     print(tasks)
-    log_filename = "%s_OC_%s.log" % (device, oc)
+    log_filename = "%s_IS_%s.log" % (device, is_)
     # We do not run the tuning in our webpage server since it takes too long.
     # Comment the following line to run it by yourself.
     #return

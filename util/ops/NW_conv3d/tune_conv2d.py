@@ -114,14 +114,14 @@ def compile_network(env, target, model,ic,oc,is_,ks,st):
     # Perform quantization in Relay
     # Note: We set opt_level to 3 in order to fold batch norm
     with tvm.transform.PassContext(opt_level=3):
-        with relay.quantize.qconfig(global_scale=8.0):
-            mod = relay.quantize.quantize(mod, params=params)
-            print(mod)
+        with relay.quantize.qconfig(global_scale=8.0,skip_conv_layers=None):
+            mod_ = relay.quantize.quantize(mod, params=params)
+    print(mod_)
     # Perform graph packing and constant folding for VTA target
     if target.device_name == "vta":
         assert env.BLOCK_IN == env.BLOCK_OUT
         relay_prog = graph_pack(
-            mod["main"],
+            mod_["main"],
             env.BATCH,
             env.BLOCK_OUT,
             env.WGT_WIDTH,
@@ -130,8 +130,10 @@ def compile_network(env, target, model,ic,oc,is_,ks,st):
             start_name_idx=3,
             stop_name_idx=9
         )
-    print(relay_prog)
-    return relay_prog, params
+        print(relay_prog)
+        return relay_prog, params
+    else:
+        return mod, params
 
 
 #################################################################
@@ -215,6 +217,7 @@ env = vta.get_env()
 # Set ``device=arm_cpu`` to run inference on the CPU
 # or ``device=vta`` to run inference on the FPGA.
 device = "vta"
+#device = "arm_cpu"
 target = env.target if device == "vta" else env.target_vta_cpu
 
 # Name of Gluon model to compile
@@ -423,8 +426,8 @@ def tune_and_evaluate():
         remote = rpc.LocalSession()
     
     # compile kernels with history best records
-    #with autotvm.tophub.context(target):
-    with autotvm.tophub.context(target, extra_files=[log_filename]):
+    with autotvm.tophub.context(target):
+    #with autotvm.tophub.context(target, extra_files=[log_filename]):
         # Compile network
         print("Compile to ",target.device_name,"...")
         if target.device_name != "vta":
